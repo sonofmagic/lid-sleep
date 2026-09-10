@@ -1,0 +1,403 @@
+#!/bin/zsh
+# Toggle macOS lid-close sleep via `pmset disablesleep`.
+# Usage: lid-sleep [on|off|toggle|status|install|uninstall|make-app]
+
+set -u
+
+PMSET=/usr/bin/pmset
+SUDOERS=/etc/sudoers.d/lid-sleep
+SCRIPT=${0:A}
+GUI=0
+FORCE=0
+CMD=""
+
+usage() {
+  cat <<'EOF'
+用法:
+  lid-sleep status      查看当前状态
+  lid-sleep on          开启合盖不睡
+  lid-sleep off         恢复合盖休眠
+  lid-sleep toggle      切换
+  lid-sleep install     一次性授权（以后不用输密码）
+  lid-sleep uninstall   撤销授权
+  lid-sleep make-app    生成菜单栏 App「合盖不睡」
+
+选项:
+  --force   电池供电时也允许开启
+  --gui     用系统对话框（给 App 用）
+  --machine 状态输出为 key=value
+EOF
+}
+
+die() {
+  print -r -- "$*" >&2
+  exit 1
+}
+
+say() {
+  print -r -- "$*"
+}
+
+is_disabled() {
+  local val
+  val=$($PMSET -g 2>/dev/null | awk '/SleepDisabled/ {print $2; found=1} END {if (!found) print 0}')
+  [[ "$val" == 1 ]]
+}
+
+power_source() {
+  $PMSET -g batt 2>/dev/null | awk -F"'" '/drawing from/ {print $2; exit}'
+}
+
+battery_percent() {
+  $PMSET -g batt 2>/dev/null | grep -Eo '[0-9]+%' | head -n 1
+}
+
+on_battery() {
+  local src
+  src=$(power_source)
+  [[ "$src" == "Battery Power" ]]
+}
+
+has_nopass() {
+  sudo -n -l 2>/dev/null | grep -F '/usr/bin/pmset disablesleep' >/dev/null
+}
+
+run_pmset() {
+  local val=$1
+  if has_nopass; then
+    sudo -n $PMSET disablesleep "$val"
+    return $?
+  fi
+  if [[ "$GUI" == 1 ]]; then
+    die "还没有授权免密。请先运行：lid-sleep --gui install"
+  fi
+  if [[ -t 0 ]]; then
+    sudo $PMSET disablesleep "$val"
+    return $?
+  fi
+  die "还没有授权免密。请先在终端运行：lid-sleep install"
+}
+
+print_status() {
+  local enabled=0 src percent nopass=0
+  is_disabled && enabled=1
+  src=$(power_source)
+  percent=$(battery_percent)
+  has_nopass && nopass=1
+  [[ -n "$src" ]] || src="未知"
+  [[ -n "$percent" ]] || percent="?"
+
+  if [[ "${1:-}" == "--machine" ]]; then
+    print -r -- "enabled=$enabled"
+    print -r -- "source=$src"
+    print -r -- "percent=$percent"
+    print -r -- "nopass=$nopass"
+    return
+  fi
+
+  if [[ "$enabled" == 1 ]]; then
+    say "合盖不睡：开"
+  else
+    say "合盖不睡：关"
+  fi
+  say "电源：$src"
+  say "电量：$percent"
+  if [[ "$nopass" == 1 ]]; then
+    say "免密：已授权"
+  else
+    say "免密：未授权（运行 lid-sleep install）"
+  fi
+}
+
+confirm_battery() {
+  on_battery || return 0
+  [[ "$FORCE" == 1 ]] && return 0
+  if [[ "$GUI" == 1 ]]; then
+    local btn
+    btn=$(osascript <<'EOF'
+button returned of (display dialog "当前是电池供电。合盖不睡会耗电发热，不要把电脑放进包里。仍要开启吗？" with title "合盖不睡" buttons {"取消", "仍然开启"} default button "取消" with icon caution)
+EOF
+    ) || return 1
+    [[ "$btn" == "仍然开启" ]]
+    return $?
+  fi
+  say "警告：当前是电池供电。合盖不睡会耗电发热，不要放进包里。"
+  say "确认开启请加 --force：lid-sleep on --force"
+  return 1
+}
+
+cmd_on() {
+  if is_disabled; then
+    say "已经是合盖不睡。"
+    return 0
+  fi
+  confirm_battery || return 1
+  run_pmset 1 || die "设置失败"
+  if is_disabled; then
+    say "已开启合盖不睡。合盖后电脑保持运行，内屏会灭。"
+  else
+    die "命令已执行，但 SleepDisabled 仍不是 1。请检查：pmset -g"
+  fi
+}
+
+cmd_off() {
+  if ! is_disabled; then
+    say "已经是合盖休眠。"
+    return 0
+  fi
+  run_pmset 0 || die "设置失败"
+  if is_disabled; then
+    die "命令已执行，但 SleepDisabled 仍是 1。请检查：pmset -g"
+  fi
+  say "已恢复合盖休眠。"
+}
+
+cmd_toggle() {
+  if is_disabled; then
+    cmd_off
+  else
+    cmd_on
+  fi
+}
+
+install_sudoers() {
+  local user tmp
+  user=$(id -un)
+  tmp=$(mktemp -t lid-sleep-sudoers)
+  cat > "$tmp" <<EOF
+#!/bin/bash
+set -euo pipefail
+umask 077
+cat > $SUDOERS <<'SNIP'
+# Managed by lid-sleep. Toggle lid-close sleep only.
+$user ALL=(root) NOPASSWD: /usr/bin/pmset disablesleep 0
+$user ALL=(root) NOPASSWD: /usr/bin/pmset disablesleep 1
+SNIP
+chmod 440 $SUDOERS
+chown root:wheel $SUDOERS
+if ! /usr/sbin/visudo -c >/dev/null; then
+  rm -f $SUDOERS
+  echo "sudoers 校验失败，已回滚" >&2
+  exit 1
+fi
+echo "已写入 $SUDOERS"
+EOF
+  chmod 700 "$tmp"
+
+  if [[ "$GUI" == 1 ]]; then
+    osascript -e "do shell script \"/bin/bash $(print -r -- $tmp)\" with administrator privileges" \
+      || { rm -f "$tmp"; die "授权取消或失败"; }
+  else
+    sudo /bin/bash "$tmp" || { rm -f "$tmp"; die "授权失败"; }
+  fi
+  rm -f "$tmp"
+
+  if has_nopass; then
+    say "免密已生效。以后 lid-sleep on/off 不用再输入密码。"
+  else
+    die "文件已写入，但 sudo 仍要密码。请检查 $SUDOERS"
+  fi
+}
+
+uninstall_sudoers() {
+  if [[ ! -e $SUDOERS ]]; then
+    say "没有安装免密规则。"
+    return 0
+  fi
+  if [[ "$GUI" == 1 ]]; then
+    osascript -e "do shell script \"rm -f $SUDOERS\" with administrator privileges" \
+      || die "撤销取消或失败"
+  else
+    sudo rm -f $SUDOERS || die "撤销失败"
+  fi
+  say "已撤销免密授权。"
+}
+
+as_string() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/" & return & "}
+  print -r -- "\"$s\""
+}
+
+as_dialog() {
+  local text=$1
+  local buttons=$2
+  local default=$3
+  local extra=${4:-}
+  osascript -e "button returned of (display dialog $(as_string "$text") with title \"合盖不睡\" buttons {$buttons} default button \"$default\" $extra)"
+}
+
+gui_panel() {
+  local enabled=0 src percent nopass=0
+  is_disabled && enabled=1
+  src=$(power_source)
+  percent=$(battery_percent)
+  has_nopass && nopass=1
+  [[ -n "$src" ]] || src="未知"
+  [[ -n "$percent" ]] || percent="?"
+
+  if [[ "$nopass" != 1 ]]; then
+    local grant
+    grant=$(as_dialog "第一次使用需要授权：只允许开关合盖休眠（pmset disablesleep），不会扩大其它权限。" '"取消", "授权"' "授权") || return 1
+    if [[ "$grant" != "授权" ]]; then
+      return 0
+    fi
+    GUI=1 install_sudoers || return 1
+  fi
+
+  local msg btn
+  if [[ "$enabled" == 1 ]]; then
+    msg="当前已开启合盖不睡。
+
+电源：${src}
+电量：${percent}
+
+合盖后电脑保持运行，内屏会灭。不要放进包里。"
+    btn=$(as_dialog "$msg" '"恢复休眠", "保持"' "保持") || return 1
+    if [[ "$btn" == "恢复休眠" ]]; then
+      GUI=1 cmd_off
+      osascript -e 'display notification "合盖后将正常休眠" with title "合盖不睡 · 已关闭"'
+    fi
+  else
+    msg="当前合盖会休眠。
+
+电源：${src}
+电量：${percent}
+
+开启后合盖也不睡，EasyTier 可继续访问。"
+    btn=$(as_dialog "$msg" '"取消", "开启"' "开启") || return 1
+    if [[ "$btn" == "开启" ]]; then
+      GUI=1 FORCE=$FORCE cmd_on
+      osascript -e 'display notification "合盖后电脑保持运行，内屏会灭" with title "合盖不睡 · 已开启"'
+    fi
+  fi
+}
+
+swift_src() {
+  local script_dir=${SCRIPT:A:h}
+  local c
+  for c in \
+    "$script_dir/../src/LidSleepBar.swift" \
+    "$HOME/.local/share/lid-sleep/LidSleepBar.swift" \
+    "$script_dir/LidSleepBar.swift"
+  do
+    if [[ -f "$c" ]]; then
+      print -r -- "${c:A}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+make_app() {
+  local app_dir="$HOME/Applications"
+  local app="$app_dir/合盖不睡.app"
+  local src tmp_bin plist
+  src=$(swift_src) || die "找不到 LidSleepBar.swift"
+  command -v swiftc >/dev/null || die "找不到 swiftc，请先安装 Xcode Command Line Tools"
+
+  tmp_bin=$(mktemp -t LidSleep)
+  /usr/bin/swiftc -O -target arm64-apple-macosx14.0 \
+    "$src" -o "$tmp_bin" \
+    -framework AppKit -framework ServiceManagement \
+    || { rm -f "$tmp_bin"; die "编译失败"; }
+
+  pkill -x LidSleep 2>/dev/null || true
+  mkdir -p "$app_dir"
+  rm -rf "$app"
+  mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+  mv "$tmp_bin" "$app/Contents/MacOS/LidSleep"
+  chmod 755 "$app/Contents/MacOS/LidSleep"
+  print -r -- "APPL????" > "$app/Contents/PkgInfo"
+
+  plist="$app/Contents/Info.plist"
+  cat > "$plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>zh-Hans</string>
+  <key>CFBundleDisplayName</key>
+  <string>合盖不睡</string>
+  <key>CFBundleExecutable</key>
+  <string>LidSleep</string>
+  <key>CFBundleIdentifier</key>
+  <string>local.icebreaker.lid-sleep</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>合盖不睡</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.1</string>
+  <key>CFBundleVersion</key>
+  <string>1.1</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>14.0</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
+</dict>
+</plist>
+PLIST
+
+  /usr/bin/codesign --force --sign - --timestamp=none "$app" >/dev/null 2>&1 || true
+  say "已生成：$app"
+  say "菜单栏会出现杯子（开）或月亮（关）图标。"
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --gui) GUI=1 ;;
+    --force|-f) FORCE=1 ;;
+    --machine) ;;
+    --help|-h) usage; exit 0 ;;
+    on|off|toggle|status|install|uninstall|make-app|has-sudo)
+      [[ -z "$CMD" ]] || die "只能指定一个命令"
+      CMD=$arg
+      ;;
+    *)
+      die "未知参数：$arg
+$(usage)"
+      ;;
+  esac
+done
+
+MACHINE=0
+for arg in "$@"; do
+  [[ "$arg" == --machine ]] && MACHINE=1
+done
+
+[[ -n "$CMD" ]] || {
+  if [[ "$GUI" == 1 ]]; then
+    CMD=gui
+  else
+    CMD=status
+  fi
+}
+
+case "$CMD" in
+  status)
+    if [[ "$MACHINE" == 1 ]]; then
+      print_status --machine
+    else
+      print_status
+    fi
+    ;;
+  on) cmd_on ;;
+  off) cmd_off ;;
+  toggle) cmd_toggle ;;
+  install) install_sudoers ;;
+  uninstall) uninstall_sudoers ;;
+  make-app) make_app ;;
+  has-sudo) has_nopass; exit $? ;;
+  gui) gui_panel ;;
+  *) usage; exit 2 ;;
+esac
