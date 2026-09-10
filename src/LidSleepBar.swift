@@ -14,8 +14,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var status = LidStatus()
 
     private var lidSleepPath: String {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".local/bin/lid-sleep").path
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        var candidates: [String] = []
+        if let bundled = Bundle.main.path(forResource: "lid-sleep", ofType: nil) {
+            candidates.append(bundled)
+        }
+        candidates.append(contentsOf: [
+            "/opt/homebrew/bin/lid-sleep",
+            "/usr/local/bin/lid-sleep",
+            home.appendingPathComponent(".local/bin/lid-sleep").path,
+        ])
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+            ?? home.appendingPathComponent(".local/bin/lid-sleep").path
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {

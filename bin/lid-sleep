@@ -4,15 +4,20 @@
 
 set -u
 
+VERSION=1.0.0
 PMSET=/usr/bin/pmset
 SUDOERS=/etc/sudoers.d/lid-sleep
 SCRIPT=${0:A}
 GUI=0
 FORCE=0
+MACHINE=0
+OUTPUT=""
 CMD=""
 
 usage() {
-  cat <<'EOF'
+  cat <<EOF
+lid-sleep $VERSION
+
 用法:
   lid-sleep status      查看当前状态
   lid-sleep on          开启合盖不睡
@@ -23,9 +28,11 @@ usage() {
   lid-sleep make-app    生成菜单栏 App「合盖不睡」
 
 选项:
-  --force   电池供电时也允许开启
-  --gui     用系统对话框（给 App 用）
-  --machine 状态输出为 key=value
+  --force            电池供电时也允许开启
+  --gui              用系统对话框（给 App 用）
+  --machine          状态输出为 key=value
+  --output <path>    make-app 输出路径
+  --version          显示版本
 EOF
 }
 
@@ -280,6 +287,7 @@ swift_src() {
   local c
   for c in \
     "$script_dir/../src/LidSleepBar.swift" \
+    "$script_dir/../share/lid-sleep/LidSleepBar.swift" \
     "$HOME/.local/share/lid-sleep/LidSleepBar.swift" \
     "$script_dir/LidSleepBar.swift"
   do
@@ -291,29 +299,40 @@ swift_src() {
   return 1
 }
 
+host_target() {
+  case $(uname -m) in
+    arm64) print -r -- arm64-apple-macosx14.0 ;;
+    x86_64) print -r -- x86_64-apple-macosx14.0 ;;
+    *) die "不支持的架构：$(uname -m)" ;;
+  esac
+}
+
 make_app() {
-  local app_dir="$HOME/Applications"
-  local app="$app_dir/合盖不睡.app"
+  local app="${OUTPUT:-$HOME/Applications/合盖不睡.app}"
   local src tmp_bin plist
   src=$(swift_src) || die "找不到 LidSleepBar.swift"
   command -v swiftc >/dev/null || die "找不到 swiftc，请先安装 Xcode Command Line Tools"
 
   tmp_bin=$(mktemp -t LidSleep)
-  /usr/bin/swiftc -O -target arm64-apple-macosx14.0 \
+  /usr/bin/swiftc -O -target "$(host_target)" \
     "$src" -o "$tmp_bin" \
     -framework AppKit -framework ServiceManagement \
     || { rm -f "$tmp_bin"; die "编译失败"; }
 
-  pkill -x LidSleep 2>/dev/null || true
-  mkdir -p "$app_dir"
+  if [[ -z "$OUTPUT" ]]; then
+    pkill -x LidSleep 2>/dev/null || true
+  fi
+  mkdir -p "${app:h}"
   rm -rf "$app"
   mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
   mv "$tmp_bin" "$app/Contents/MacOS/LidSleep"
   chmod 755 "$app/Contents/MacOS/LidSleep"
+  cp "$SCRIPT" "$app/Contents/Resources/lid-sleep"
+  chmod 755 "$app/Contents/Resources/lid-sleep"
   print -r -- "APPL????" > "$app/Contents/PkgInfo"
 
   plist="$app/Contents/Info.plist"
-  cat > "$plist" <<'PLIST'
+  cat > "$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -325,7 +344,7 @@ make_app() {
   <key>CFBundleExecutable</key>
   <string>LidSleep</string>
   <key>CFBundleIdentifier</key>
-  <string>local.icebreaker.lid-sleep</string>
+  <string>com.sonofmagic.lid-sleep</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
@@ -333,9 +352,9 @@ make_app() {
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.1</string>
+  <string>$VERSION</string>
   <key>CFBundleVersion</key>
-  <string>1.1</string>
+  <string>$VERSION</string>
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
   <key>LSUIElement</key>
@@ -353,26 +372,32 @@ PLIST
   say "菜单栏会出现杯子（开）或月亮（关）图标。"
 }
 
-for arg in "$@"; do
-  case "$arg" in
+while (( $# )); do
+  case "$1" in
     --gui) GUI=1 ;;
     --force|-f) FORCE=1 ;;
-    --machine) ;;
+    --machine) MACHINE=1 ;;
+    --output)
+      shift
+      [[ -n "${1:-}" ]] || die "--output 需要路径"
+      OUTPUT=$1
+      ;;
+    --output=*)
+      OUTPUT=${1#*=}
+      [[ -n "$OUTPUT" ]] || die "--output 需要路径"
+      ;;
+    --version|-v) CMD=version ;;
     --help|-h) usage; exit 0 ;;
     on|off|toggle|status|install|uninstall|make-app|has-sudo)
-      [[ -z "$CMD" ]] || die "只能指定一个命令"
-      CMD=$arg
+      [[ -z "$CMD" || "$CMD" == version ]] || die "只能指定一个命令"
+      CMD=$1
       ;;
     *)
-      die "未知参数：$arg
+      die "未知参数：$1
 $(usage)"
       ;;
   esac
-done
-
-MACHINE=0
-for arg in "$@"; do
-  [[ "$arg" == --machine ]] && MACHINE=1
+  shift
 done
 
 [[ -n "$CMD" ]] || {
@@ -384,6 +409,7 @@ done
 }
 
 case "$CMD" in
+  version) print -r -- "$VERSION" ;;
   status)
     if [[ "$MACHINE" == 1 ]]; then
       print_status --machine

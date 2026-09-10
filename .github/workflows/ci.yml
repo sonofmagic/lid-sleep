@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax and CLI
+        run: |
+          zsh -n bin/lid-sleep
+          chmod +x bin/lid-sleep install.sh
+          ./bin/lid-sleep --help
+          test "$(./bin/lid-sleep --version)" = "1.0.0"
+      - name: Build menu bar app
+        run: |
+          ./bin/lid-sleep make-app --output "$RUNNER_TEMP/HeGaiBuShui.app"
+          test -x "$RUNNER_TEMP/HeGaiBuShui.app/Contents/MacOS/LidSleep"
+          test -x "$RUNNER_TEMP/HeGaiBuShui.app/Contents/Resources/lid-sleep"
+          "$RUNNER_TEMP/HeGaiBuShui.app/Contents/Resources/lid-sleep" --version

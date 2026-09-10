@@ -1,0 +1,37 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build app
+        run: |
+          chmod +x bin/lid-sleep
+          ./bin/lid-sleep make-app --output "$RUNNER_TEMP/合盖不睡.app"
+          ditto -c -k --keepParent "$RUNNER_TEMP/合盖不睡.app" "$RUNNER_TEMP/lid-sleep-macos.zip"
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            ${{ runner.temp }}/lid-sleep-macos.zip
+          body: |
+            Ad-hoc signed build for testing.
+
+            Official Homebrew cask still needs Apple Developer ID + notarization.
+            Until then, prefer the source formula:
+
+            ```
+            brew tap sonofmagic/lid-sleep
+            brew trust --tap sonofmagic/lid-sleep
+            brew install lid-sleep
+            ```
